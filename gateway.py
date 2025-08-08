@@ -1,171 +1,110 @@
-"""
-Sıfır harici bağımlılık ile çalışan OIDC/UMA Gateway.
-Sadece Python Standart Kütüphanesi kullanır.
-NGINX Unit üzerinde çalışmak üzere tasarlanmıştır.
-
-Uyarı: Oturumlar (session) bellekte tutulur ve kalıcı değildir.
-Container yeniden başladığında tüm oturumlar sıfırlanır.
-"""
 import os
 import json
 import uuid
-from http.cookies import SimpleCookie
-from urllib.parse import urlencode, parse_qsl, urlparse, urlunparse
-from urllib.request import urlopen, Request
-from urllib.error import HTTPError
+import requests
+from urllib.parse import urlencode, parse_qsl
+from mitmproxy import http, ctx
 
-# --- Konfigürasyon ---
-KC_URL = os.environ.get("KEYCLOAK_URL")
+# --- Konfigürasyon (Ortam değişkenlerinden) ---
+KC_BROWSER_URL = os.environ.get("KEYCLOAK_BROWSER_URL")
+KC_INTERNAL_URL = os.environ.get("KEYCLOAK_URL")
 KC_REALM = os.environ.get("KEYCLOAK_REALM")
 CLIENT_ID = os.environ.get("OIDC_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET")
 CALLBACK_URL = os.environ.get("OIDC_CALLBACK_URL")
-BACKEND_URL = os.environ.get("BACKEND_SERVICE_URL")
 
-KC_AUTH_URL = f"{KC_URL}/realms/{KC_REALM}/protocol/openid-connect/auth"
-KC_TOKEN_URL = f"{KC_URL}/realms/{KC_REALM}/protocol/openid-connect/token"
+KC_AUTH_URL = f"{KC_BROWSER_URL}/realms/{KC_REALM}/protocol/openid-connect/auth"
+KC_TOKEN_URL = f"{KC_INTERNAL_URL}/realms/{KC_REALM}/protocol/openid-connect/token"
 
-# --- Bellek İçi Oturum Deposu ---
+# --- Sunucu tarafı oturum deposu ---
 SESSIONS = {}
 
-# --- Yardımcı Fonksiyonlar ---
-
-def make_request(url, data=None, headers={}):
-    """urllib kullanarak HTTP isteği yapan yardımcı fonksiyon."""
-    req = Request(url, data=data, headers=headers)
+def check_uma_permission(access_token):
+    """Keycloak UMA'dan izin kontrolü yapar."""
+    payload = {'grant_type': 'urn:ietf:params:oauth:grant-type:uma-ticket', 'audience': CLIENT_ID, 'response_mode': 'decision'}
+    headers = {'Authorization': f'Bearer {access_token}'}
+    auth = (CLIENT_ID, CLIENT_SECRET)
     try:
-        with urlopen(req) as response:
-            return response.read(), response.status, response.getheaders()
-    except HTTPError as e:
-        return e.read(), e.code, e.headers.items()
+        res = requests.post(KC_TOKEN_URL, data=payload, headers=headers, auth=auth)
+        if res.status_code == 200 and res.json().get('result') is True:
+            ctx.log.info("✅ UMA Check: Access GRANTED by Keycloak PDP")
+            return True
+        ctx.log.error(f"❌ UMA Check: Access DENIED by Keycloak PDP: {res.status_code} {res.text}")
+        return False
+    except requests.RequestException as e:
+        ctx.log.error(f"❌ UMA Check: Keycloak connection error: {e}")
+        return False
 
-def exchange_code_for_token(code):
-    """Authorization code'u access token ile takas eder."""
-    payload = urlencode({
-        'grant_type': 'authorization_code',
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'code': code,
-        'redirect_uri': CALLBACK_URL
-    }).encode('utf-8')
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    body, status, _ = make_request(KC_TOKEN_URL, data=payload, headers=headers)
-    if status == 200:
-        return json.loads(body)
-    return None
+class OidcGateway:
+    def request(self, flow: http.HTTPFlow) -> None:
+        # ÖNCELİKLE OTURUM KONTROLÜ YAP
+        session_id = flow.request.cookies.get("session_id", None)
+        user_session = SESSIONS.get(session_id) if session_id else None
 
-def check_uma_permission(access_token, resource_path):
-    """UMA iznini kontrol eder."""
-    payload = urlencode({
-        'grant_type': 'urn:ietf:params:oauth:grant-type:uma-ticket',
-        'audience': CLIENT_ID,
-        'permission': resource_path,
-        'response_mode': 'decision'
-    }).encode('utf-8')
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
-    body, status, _ = make_request(KC_TOKEN_URL, data=payload, headers=headers)
-    if status == 200:
-        return json.loads(body).get('result', False)
-    return False
+        # 1. Senaryo: Kullanıcının geçerli bir oturumu ve token'ı VAR
+        if user_session and "access_token" in user_session:
+            # Kullanıcı zaten login olmuş. Sadece UMA iznini kontrol et.
+            # /login veya /_callback'e gitse bile, oturumu olduğu için işlem yapmasına izin ver.
+            if not check_uma_permission(user_session["access_token"]):
+                flow.response = http.Response.make(403, b'{"error": "Access Denied by Policy Decision Point"}', {"Content-Type": "application/json"})
+            # İzin varsa, hiçbir şey yapma, istek backend'e gitsin.
+            return
 
-def proxy_request(environ, start_response):
-    """İsteği backend'e proxy'ler."""
-    path = environ.get('PATH_INFO', '')
-    query = environ.get('QUERY_STRING', '')
-    method = environ.get('REQUEST_METHOD')
+        # 2. Senaryo: Kullanıcının oturumu YOK ama CALLBACK adresine geliyor
+        # Bu, login sürecinin bir parçasıdır.
+        if flow.request.path.startswith("/_callback"):
+            self.handle_callback(flow)
+            return
 
-    backend_url_parts = list(urlparse(BACKEND_URL))
-    backend_url_parts[2] = path
-    backend_url_parts[4] = query
-    full_backend_url = urlunparse(backend_url_parts)
+        # 3. Senaryo: Kullanıcının oturumu YOK ve diğer tüm sayfalara gitmeye çalışıyor
+        # (/get, /admin, /login dahil). Her durumda onu login olmaya zorla.
+        self.handle_login(flow)
+        return
 
-    headers = {
-        key.replace('HTTP_', '', 1).replace('_', '-').title(): value
-        for key, value in environ.items() if key.startswith('HTTP_')
-    }
-    headers['Host'] = urlparse(BACKEND_URL).netloc
-
-    content_length = int(environ.get('CONTENT_LENGTH', 0))
-    request_body = environ['wsgi.input'].read(content_length) if content_length > 0 else None
-    
-    body, status, resp_headers = make_request(
-        full_backend_url, 
-        data=request_body, 
-        headers=headers
-    )
-    
-    start_response(f"{status} Status", resp_headers)
-    return [body]
-
-# --- Ana WSGI Uygulaması ---
-
-def application(environ, start_response):
-    """Tüm istekleri karşılayan ana WSGI fonksiyonu."""
-    path = environ.get('PATH_INFO', '')
-    cookies = SimpleCookie(environ.get('HTTP_COOKIE', ''))
-    session_id = cookies.get('session_id', None)
-    
-    user_session = SESSIONS.get(session_id.value) if session_id else None
-
-    # 1. Callback Rotası
-    if path == '/_callback':
-        # DÜZELTİLMİŞ KISIM: 'environ' içindeki QUERY_STRING'i ayrıştırıyoruz.
-        query_params = dict(parse_qsl(environ.get('QUERY_STRING', '')))
-        state_from_query = query_params.get('state')
-        code_from_query = query_params.get('code')
-
-        if not user_session or state_from_query != user_session.get('state'):
-            start_response('400 Bad Request', [('Content-Type', 'text/plain')])
-            return [b'Invalid state parameter']
-
-        if not code_from_query:
-            start_response('400 Bad Request', [('Content-Type', 'text/plain')])
-            return [b'Authorization code not found in callback']
-
-        tokens = exchange_code_for_token(code_from_query)
-        if not tokens:
-            start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
-            return [b'Failed to exchange code for token']
-        
-        user_session['access_token'] = tokens['access_token']
-        redirect_to = user_session.pop('original_url', '/')
-        
-        start_response('302 Found', [('Location', redirect_to)])
-        return []
-
-    # 2. Login Rotası (veya oturumu olmayan herhangi bir istek)
-    if not user_session or 'access_token' not in user_session:
+    def handle_login(self, flow: http.HTTPFlow):
+        # Yeni bir oturum başlat
         session_id = str(uuid.uuid4())
         state = str(uuid.uuid4())
-        original_url = f"{environ.get('wsgi.url_scheme')}://{environ.get('HTTP_HOST')}{environ.get('PATH_INFO', '')}"
-        if environ.get('QUERY_STRING'):
-            original_url += f"?{environ.get('QUERY_STRING')}"
-            
-        SESSIONS[session_id] = {'state': state, 'original_url': original_url}
         
-        auth_params = urlencode({
-            'client_id': CLIENT_ID,
-            'response_type': 'code',
-            'scope': 'openid',
-            'redirect_uri': CALLBACK_URL,
-            'state': state
-        })
+        # Eğer kullanıcı doğrudan /login'e gelmediyse, geldiği adresi kaydet.
+        # Eğer /login'e geldiyse, anasayfaya yönlendir.
+        original_url = flow.request.pretty_url
+        if "/login" in original_url:
+            original_url = f"{flow.request.scheme}://{flow.request.host}/"
+
+        SESSIONS[session_id] = {"state": state, "original_url": original_url}
+
+        auth_params = urlencode({'client_id': CLIENT_ID, 'response_type': 'code', 'scope': 'openid', 'redirect_uri': CALLBACK_URL, 'state': state})
         login_url = f"{KC_AUTH_URL}?{auth_params}"
         
-        headers = [
-            ('Location', login_url),
-            ('Set-Cookie', f'session_id={session_id}; Path=/; HttpOnly')
-        ]
-        start_response('302 Found', headers)
-        return []
+        # 302 Redirect yanıtı oluştur ve tarayıcıyı Keycloak'a yönlendir.
+        flow.response = http.Response.make(
+            302,
+            b'',
+            {"Location": login_url, "Set-Cookie": f"session_id={session_id}; Path=/; HttpOnly; SameSite=Lax"}
+        )
 
-    # 3. Oturumu olan ve yetkilendirilecek istekler
-    if not check_uma_permission(user_session['access_token'], path):
-        start_response('403 Forbidden', [('Content-Type', 'text/plain')])
-        return [b'Access Denied by Policy Decision Point']
+    def handle_callback(self, flow: http.HTTPFlow):
+        session_id = flow.request.cookies.get("session_id", None)
+        user_session = SESSIONS.get(session_id) if session_id else None
+        query_params = dict(parse_qsl(flow.request.url.split('?', 1)[1]))
+        
+        if not user_session or query_params.get("state") != user_session.get("state"):
+            flow.response = http.Response.make(400, b"Invalid state parameter")
+            return
+            
+        code = query_params.get("code")
+        token_payload = {'grant_type': 'authorization_code', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'code': code, 'redirect_uri': CALLBACK_URL}
+        res = requests.post(KC_TOKEN_URL, data=token_payload)
 
-    # 4. Yetki varsa, backend'e proxy'le
-    return proxy_request(environ, start_response)
+        if res.status_code != 200:
+            flow.response = http.Response.make(500, f"Failed to get token: {res.text}".encode())
+            return
+
+        tokens = res.json()
+        user_session["access_token"] = tokens["access_token"]
+        redirect_to = user_session.pop("original_url", "/")
+
+        flow.response = http.Response.make(302, b'', {"Location": redirect_to})
+
+addons = [OidcGateway()]
