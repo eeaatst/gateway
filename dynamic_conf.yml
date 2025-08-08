@@ -1,0 +1,48 @@
+# dynamic_conf.yml (Tam ve Güncel Hali)
+http:
+  routers:
+    # ... Diğer router tanımları aynı kalabilir ...
+    keycloak-direct-router:
+      rule: "Host(`keycloak.localhost`)"
+      service: "keycloak-service"
+      entryPoints:
+        - "web"
+    auth-router:
+      rule: "Host(`auth.localhost`)"
+      service: "keycloak-service"
+      entryPoints:
+        - "web"
+    backend-router:
+      rule: "Host(`backend.localhost`)"
+      service: "backend-service"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "forward-auth"
+    dashboard-router:
+      rule: "PathPrefix(`/dashboard`) || PathPrefix(`/api`)"
+      service: "api@internal"
+      entryPoints:
+        - "dashboard"
+
+  services:
+    # ... Servis tanımları aynı kalabilir ...
+    keycloak-service:
+      loadBalancer:
+        servers:
+          - url: "http://keycloak:8080" # Bu DAHİLİ port, değişmesine gerek yok.
+    # ...
+    backend-service:
+      loadBalancer:
+        servers:
+          - url: "http://backend:80"
+  middlewares:
+    forward-auth:
+      forwardAuth:
+        # --- DEĞİŞİKLİK BURADA ---
+        # auth-proxy, Keycloak'a artık 9080 portundan erişecek.
+        address: "http://auth-proxy:4181"
+        # Not: auth-proxy'nin KENDİ ayarlarındaki PROVIDERS_OIDC_ISSUER_URL de
+        # 9080 portunu kullanmalı. Onu da compose dosyasında güncelleyelim.
+        authResponseHeaders:
+          - "X-Forwarded-User"

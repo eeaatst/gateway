@@ -1,0 +1,28 @@
+{
+  "listeners": {
+    "*:9080": {
+      "pass": "routes/keycloak_router"
+    }
+  },
+
+  "routes": {
+    "keycloak_router": [
+      {
+        "match": {
+          "host": [ "keycloak.localhost", "kcadmin.localhost" ]
+        },
+        "action": {
+          "pass": "upstreams/keycloak_backend"
+        }
+      }
+    ]
+  },
+
+  "upstreams": {
+    "keycloak_backend": {
+      "servers": {
+        "keycloak:8080": {}
+      }
+    }
+  }
+}

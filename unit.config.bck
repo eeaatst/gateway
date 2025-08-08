@@ -1,0 +1,42 @@
+{
+  "listeners": {
+    "*:9080": {
+      "pass": "routes/main_router"
+    }
+  },
+
+  "routes": {
+    "main_router": [
+      {
+        "match": {
+          "host": [ "keycloak.localhost", "kcadmin.localhost" ]
+        },
+        "action": {
+          "pass": "upstreams/keycloak_backend"
+        }
+      },
+      {
+        "action": {
+          "pass": "applications/python_gateway"
+        }
+      }
+    ]
+  },
+
+  "upstreams": {
+    "keycloak_backend": {
+      "servers": {
+        "keycloak:8080": {}
+      }
+    }
+  },
+
+  "applications": {
+    "python_gateway": {
+      "type": "python",
+      "path": "/app/",
+      "module": "gateway",
+      "callable": "application"
+    }
+  }
+}
